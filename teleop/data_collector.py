@@ -24,6 +24,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -251,6 +252,23 @@ def parse_args():
         action="store_true",
         help="Skip the wrist RealSense camera. Intended for --camera-only debugging.",
     )
+    parser.add_argument(
+        "--disable-motion-start-detect",
+        action="store_true",
+        help="Record immediately after SPACE instead of waiting for detected arm motion.",
+    )
+    parser.add_argument(
+        "--motion-threshold",
+        type=float,
+        default=0.005,
+        help="Joint-space max delta threshold for motion-start detection.",
+    )
+    parser.add_argument(
+        "--preroll-frames",
+        type=int,
+        default=5,
+        help="Frames kept before detected motion when motion-start detection is enabled.",
+    )
     return parser.parse_args()
 
 
@@ -393,10 +411,20 @@ def main():
     else:
         dataset = None
 
+    print(
+        f"  Timing: control={CONTROL_RATE_HZ}Hz, image_poll={IMAGE_RATE_HZ}Hz, "
+        f"dataset_fps={getattr(dataset, 'fps', CONTROL_RATE_HZ) if dataset is not None else CONTROL_RATE_HZ}Hz"
+    )
+    if IMAGE_RATE_HZ != CONTROL_RATE_HZ:
+        print("  [WARN] IMAGE_RATE_HZ differs from CONTROL_RATE_HZ; adjacent dataset frames may reuse images.")
+
     # --- State ---
     recording = False
     episode_count = getattr(dataset, "num_episodes", 0) if dataset is not None else 0
     prev_state = None  # for computing action = next state
+    start_state = None
+    motion_started = False
+    motion_preroll = deque(maxlen=max(1, args.preroll_frames))
     stop_event = threading.Event()
     img_buf = ImageBuffer()
 
@@ -411,6 +439,11 @@ def main():
     print("  SPACE = record/save    R = discard+restart")
     print("  E = enable             D = disable            Q/ESC = quit")
     print("  Return both arms to your fixed start pose manually before SPACE.")
+    if not args.disable_motion_start_detect:
+        print(
+            f"  Motion-start detect: threshold={args.motion_threshold}, "
+            f"pre-roll={max(1, args.preroll_frames)} frames"
+        )
     print("─" * 60 + "\n")
 
     try:
@@ -446,10 +479,34 @@ def main():
                         "observation.images.wrist_rgb": np.transpose(wrist_frame.rgb, (2, 0, 1)),
                         "observation.images.global_rgb": np.transpose(global_frame.rgb, (2, 0, 1)),
                     }
-                    try:
-                        dataset.add_frame(frame)
-                    except Exception as e:
-                        print(f"  [WARN] add_frame: {e}")
+                    if args.disable_motion_start_detect or motion_started:
+                        try:
+                            dataset.add_frame(frame)
+                        except Exception as e:
+                            print(f"  [WARN] add_frame: {e}")
+                    else:
+                        motion_preroll.append(frame)
+                        if start_state is not None:
+                            motion = float(
+                                np.max(
+                                    np.abs(
+                                        np.asarray(cur_state[:6], dtype=np.float32)
+                                        - np.asarray(start_state[:6], dtype=np.float32)
+                                    )
+                                )
+                            )
+                            if motion > args.motion_threshold:
+                                motion_started = True
+                                try:
+                                    for buffered_frame in motion_preroll:
+                                        dataset.add_frame(buffered_frame)
+                                    print(
+                                        f"  Motion detected at {motion:.4f}; "
+                                        f"flushed {len(motion_preroll)} pre-roll frames."
+                                    )
+                                    motion_preroll.clear()
+                                except Exception as e:
+                                    print(f"  [WARN] add_frame: {e}")
                 prev_state = cur_state
 
             # --- Preview ---
@@ -470,6 +527,9 @@ def main():
                     else:
                         recording = True
                         prev_state = None
+                        start_state = cur_state
+                        motion_started = args.disable_motion_start_detect
+                        motion_preroll.clear()
                         if dataset:
                             clear_dataset_buffer(dataset)
                         print(f"\n  >>> Recording episode {episode_count + 1} ...")
@@ -483,10 +543,16 @@ def main():
                     else:
                         clear_dataset_buffer(dataset)
                         print("  Too short, discarded.")
+                    start_state = None
+                    motion_started = False
+                    motion_preroll.clear()
             elif key in (ord('r'), ord('R')):
                 if recording:
                     clear_dataset_buffer(dataset)
                     prev_state = None
+                    start_state = cur_state
+                    motion_started = args.disable_motion_start_detect
+                    motion_preroll.clear()
                     print(f"  Discarded. Restarting episode {episode_count + 1} ...")
                 else:
                     print("  [WARN] R only works while recording.")

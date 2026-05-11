@@ -12,6 +12,7 @@ This runs the policy on dataset episodes (not used in training) and computes:
 """
 
 import argparse
+import copy
 import sys
 from pathlib import Path
 
@@ -21,6 +22,42 @@ from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def load_policy_processors(policy, checkpt: str, device: torch.device):
+    """Load the same pre/post processors used during deployment."""
+    from lerobot.policies.factory import make_pre_post_processors
+
+    preprocessor_overrides = {
+        "device_processor": {"device": device.type},
+        "normalizer_processor": {"device": device.type},
+    }
+    postprocessor_overrides = {
+        "unnormalizer_processor": {"device": device.type},
+        "device_processor": {"device": "cpu"},
+    }
+    return make_pre_post_processors(
+        policy_cfg=policy.config,
+        pretrained_path=checkpt,
+        preprocessor_overrides=preprocessor_overrides,
+        postprocessor_overrides=postprocessor_overrides,
+    )
+
+
+def reshape_visual_stats_for_broadcast(stats, policy_features):
+    """LeRobot v0.5.2 dataset visual stats may be (C,), but images are (B,C,H,W)."""
+    from lerobot.configs import FeatureType
+
+    fixed = copy.deepcopy(stats)
+    for key, feature in policy_features.items():
+        if feature.type != FeatureType.VISUAL or key not in fixed:
+            continue
+        channels = feature.shape[0]
+        for stat_name, value in fixed[key].items():
+            arr = np.asarray(value, dtype=np.float32)
+            if arr.ndim == 1 and arr.shape[0] == channels:
+                fixed[key][stat_name] = arr.reshape(channels, 1, 1)
+    return fixed
 
 
 def build_pre_post_processors(policy, dataset):
@@ -38,9 +75,11 @@ def build_pre_post_processors(policy, dataset):
         FeatureType.ACTION: NormalizationMode.MEAN_STD,
     }
 
+    stats = reshape_visual_stats_for_broadcast(dataset.meta.stats, policy_features)
+
     normalizer = NormalizerProcessorStep(
         features=policy_features, norm_map=norm_map,
-        stats=dataset.meta.stats, device="cpu",
+        stats=stats, device="cpu",
     )
     preprocessor = PolicyProcessorPipeline(
         steps=[normalizer], to_transition=batch_to_transition, to_output=transition_to_batch,
@@ -48,7 +87,7 @@ def build_pre_post_processors(policy, dataset):
 
     unnormalizer = UnnormalizerProcessorStep(
         features=policy_features, norm_map=norm_map,
-        stats=dataset.meta.stats, device="cpu",
+        stats=stats, device="cpu",
     )
     postprocessor = PolicyProcessorPipeline(
         steps=[unnormalizer], to_transition=policy_action_to_transition,
@@ -61,6 +100,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpt", type=str, required=True,
                         help="Path to trained ACT checkpoint")
+    parser.add_argument("--dataset-root", type=str, default="data/lerobot_dataset",
+                        help="Path to LeRobot dataset root used for offline evaluation")
+    parser.add_argument("--dataset-repo-id", type=str, default="piper/bottle_grasp",
+                        help="LeRobot dataset repo_id")
     parser.add_argument("--episodes", type=int, default=3,
                         help="Number of episodes to evaluate (0 = all)")
     parser.add_argument("--no-plot", action="store_true",
@@ -80,11 +123,19 @@ def main():
     # Load dataset
     print("Loading dataset ...")
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    dataset = LeRobotDataset("piper/bottle_grasp", root="data/lerobot_dataset")
+    dataset = LeRobotDataset(args.dataset_repo_id, root=args.dataset_root)
     print(f"  {dataset.num_episodes} episodes, {len(dataset)} frames")
 
-    # Build normalization
-    preprocessor, postprocessor = build_pre_post_processors(policy, dataset)
+    # Build normalization. Prefer checkpoint processors so offline eval matches deployment.
+    try:
+        preprocessor, postprocessor = load_policy_processors(policy, args.checkpt, device)
+    except Exception as e:
+        print(f"  [WARN] Could not load checkpoint processors ({e}); using dataset stats.")
+        preprocessor, postprocessor = build_pre_post_processors(policy, dataset)
+    if hasattr(preprocessor, "reset"):
+        preprocessor.reset()
+    if hasattr(postprocessor, "reset"):
+        postprocessor.reset()
 
     # Pick eval episodes (use last N episodes, not the first ones used in training)
     total_eps = dataset.num_episodes

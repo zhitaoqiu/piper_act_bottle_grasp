@@ -26,7 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from hardware.piper_wrapper import PiperRobot
 from camera.rs_camera import RealSenseCamera, USBCamera, find_realsense_devices
 
-PIPER_GRIPPER_MAX_M = 0.10
+PIPER_GRIPPER_MAX_M = 0.035
 
 
 def load_policy_processors(policy, checkpt: str, device: torch.device):
@@ -86,6 +86,26 @@ def fmt_vec(values, precision=3):
     return "[" + ", ".join(f"{float(v):.{precision}f}" for v in values) + "]"
 
 
+def max_abs_diff(cur, prev) -> float:
+    if prev is None:
+        return float("nan")
+    return float(np.max(np.abs(np.asarray(cur, dtype=np.float32) - np.asarray(prev, dtype=np.float32))))
+
+
+def select_policy_action(policy, postprocessor, normalized_obs, replan_every_step: bool):
+    """Return one unnormalized action, optionally bypassing ACT's open-loop queue."""
+    if replan_every_step:
+        if hasattr(policy, "predict_action_chunk"):
+            action_chunk = policy.predict_action_chunk(normalized_obs)
+            action_chunk = postprocessor(action_chunk)
+            return action_chunk[:, 0, :]
+
+        policy.reset()
+
+    action = policy.select_action(normalized_obs)
+    return postprocessor(action)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpt", type=str, required=True,
@@ -106,6 +126,8 @@ def main():
                         help="Print current state, predicted target, and delta during rollout.")
     parser.add_argument("--debug-every", type=int, default=10,
                         help="Print one debug line every N action steps.")
+    parser.add_argument("--replan-every-step", action="store_true",
+                        help="Recompute a fresh ACT action chunk every control step instead of consuming the action queue.")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -162,6 +184,8 @@ def main():
     print("  Manually place the arm at the same start pose used for collection before SPACE.")
     if args.dry_run:
         print("  DRY RUN: robot commands will not be sent.")
+    if args.replan_every_step:
+        print("  REPLAN: policy will predict a fresh first action at every step.")
     print("-" * 60 + "\n")
 
     try:
@@ -188,6 +212,8 @@ def main():
             postprocessor.reset()
 
             action_total = max(1, args.max_steps)
+            last_target = None
+            last_state = None
             for step in range(action_total):
                 loop_start = time.time()
 
@@ -204,8 +230,9 @@ def main():
                 # Run inference
                 with torch.inference_mode():
                     normalized_obs = preprocessor(obs)
-                    action = policy.select_action(normalized_obs)
-                    action = postprocessor(action)
+                    action = select_policy_action(
+                        policy, postprocessor, normalized_obs, args.replan_every_step
+                    )
 
                 # action shape: (1, 7) -> (7,)
                 if action.dim() == 2:
@@ -219,16 +246,21 @@ def main():
                 delta = target - np.asarray(robot_state, dtype=np.float32)
                 max_arm_delta = float(np.max(np.abs(delta[:6])))
                 gripper_delta = float(abs(delta[6]))
+                target_diff = max_abs_diff(target, last_target)
+                state_diff = max_abs_diff(robot_state, last_state)
                 if args.debug_actions and (
                     step == 0 or step == action_total - 1 or step % max(1, args.debug_every) == 0
                 ):
                     print(
                         f"  step {step+1:03d}: "
                         f"max_arm_delta={max_arm_delta:.4f} rad, "
-                        f"gripper_delta={gripper_delta:.4f} m"
+                        f"gripper_delta={gripper_delta:.4f} m, "
+                        f"target_diff_from_last_target={target_diff:.4f}, "
+                        f"state_diff_from_last_state={state_diff:.4f}"
                     )
                     print(f"    state : {fmt_vec(robot_state)}")
                     print(f"    target: {fmt_vec(target)}")
+                    print(f"    delta : {fmt_vec(delta)}")
 
                 if not args.dry_run:
                     sent = robot.set_joint_positions(target.tolist(), velocity_pct=args.velocity_pct)
@@ -247,6 +279,9 @@ def main():
                 step_time = 1.0 / args.hz
                 if elapsed < step_time:
                     time.sleep(step_time - elapsed)
+
+                last_target = target.copy()
+                last_state = np.asarray(robot_state, dtype=np.float32).copy()
 
             print("  Trajectory complete.")
 

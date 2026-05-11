@@ -90,6 +90,8 @@ sudo bash scripts/setup_can.sh
 ## 完整工作流
 
 > 详细的逐步操作指南请阅读 **[docs/workflow.md](docs/workflow.md)**，包含每一步的预期输出、故障排查和操作细节。以下为快速概览。
+>
+> ACT 静止帧、裁剪对齐、chunk size 和 checkpoint 排查请阅读 **[docs/act_debugging.md](docs/act_debugging.md)**。
 
 ### Step 1 — 验证硬件
 
@@ -143,6 +145,18 @@ python3 inference/deploy.py \
 ```
 
 按**空格**执行一次抓取。可选 `--velocity-pct 30` 调低速度更安全。
+
+调试“抬不起来 / 抬一下停住”时建议先用：
+
+```bash
+python3 inference/deploy.py \
+    --checkpt outputs/train/piper_bottle_grasp/checkpoints/020000/pretrained_model \
+    --debug-actions \
+    --debug-every 1 \
+    --replan-every-step
+```
+
+完整数据诊断、重建式裁剪、chunk size 对照训练和 checkpoint 批量评估命令见 [docs/act_debugging.md](docs/act_debugging.md)。
 
 ## 已知问题与修复
 

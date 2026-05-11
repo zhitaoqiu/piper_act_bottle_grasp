@@ -1,0 +1,13 @@
+{
+  "dataset_root": "data/lerobot_dataset_rebuilt",
+  "fps": 30,
+  "video_fps": {
+    "observation.images.wrist_rgb": 30,
+    "observation.images.global_rgb": 30
+  },
+  "num_frames": 4968,
+  "num_episodes": 20,
+  "motion_threshold": 0.005,
+  "jump_threshold": 0.2,
+  "report_csv": "reports/motion_rebuilt/motion_report.csv"
+}
