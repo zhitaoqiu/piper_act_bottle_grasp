@@ -91,6 +91,8 @@ def parse_args():
     parser.add_argument("--motion-threshold", type=float, default=0.005)
     parser.add_argument("--preroll-frames", type=int, default=5)
     parser.add_argument("--tail-frames", type=int, default=8)
+    parser.add_argument("--episode", type=int, action="append", default=None,
+                        help="Only rebuild this source episode. May be provided multiple times.")
     parser.add_argument("--report-path", type=Path, default=Path("reports/trim_report.csv"))
     parser.add_argument("--overwrite", action="store_true",
                         help="Delete output-root first if it already exists.")
@@ -128,6 +130,16 @@ def main() -> int:
     data_df = read_parquet_tree(input_root / "data")
     data_df = data_df.reset_index(drop=True)
     data_df["_row_pos"] = np.arange(len(data_df), dtype=np.int64)
+    episodes = sorted(int(ep) for ep in data_df["episode_index"].unique())
+    if args.episode is not None:
+        requested = set(args.episode)
+        episodes = [ep for ep in episodes if ep in requested]
+        missing = requested - set(episodes)
+        if missing:
+            raise ValueError(f"Requested episodes not found: {sorted(missing)}")
+    if not episodes:
+        raise ValueError("No episodes selected for rebuild")
+    print(f"Selected source episodes: {episodes}")
 
     print(f"Loading source dataset: {input_root}")
     source = LeRobotDataset(
@@ -153,8 +165,7 @@ def main() -> int:
 
     report_rows = []
     try:
-        for ep_id in sorted(data_df["episode_index"].unique()):
-            ep_id = int(ep_id)
+        for ep_id in episodes:
             ep_df = data_df[data_df["episode_index"] == ep_id].copy()
             ep_df = ep_df.sort_values("index" if "index" in ep_df else "frame_index")
             states = stack_vectors(ep_df["observation.state"], "observation.state")

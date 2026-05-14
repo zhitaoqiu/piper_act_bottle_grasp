@@ -39,6 +39,14 @@ python3 scripts/analyze_dataset_motion.py \
 python3 teleop/data_collector.py --disable-motion-start-detect
 ```
 
+如果摄像头位置变了，先不要混进旧数据集；单独采一条用于 overfit：
+
+```bash
+python3 teleop/data_collector.py \
+  --dataset-root data/lerobot_dataset_one_ep_current_cam \
+  --global-camera auto
+```
+
 ## 2. 重建式裁剪，不要原地删数据
 
 ```bash
@@ -76,6 +84,67 @@ bash training/train_act_chunk10.sh
 ```
 
 小数据集优先试 `chunk10`，因为 `chunk_size=20 / n_action_steps=20` 在真机上开环太久时，容易出现只抬一下、后续预测变平的问题。
+
+## 3.5. 修复坍缩：delta action + phase input
+
+如果离线 rollout 里 `pred_range` 和 `chunk_internal_range` 都接近 0，说明策略坍缩成常数 absolute target。此时不要继续上真机，先把训练目标改成相对 waypoint：
+
+```bash
+python3 scripts/rebuild_delta_phase_dataset.py \
+  --input-root data/lerobot_dataset_rebuilt_v1 \
+  --output-root data/lerobot_dataset_delta_phase \
+  --delta-horizon-frames 5 \
+  --report-path reports/delta_phase_report.csv
+```
+
+这个数据集会把：
+
+- `observation.state` 从 7 维扩到 8 维：`[j1..j6, gripper, phase]`
+- `action` 改成 5 帧后的相对 waypoint：`state[t+5] - state[t]`
+
+先做一条 episode 的 overfit sanity check：
+
+```bash
+python3 scripts/rebuild_delta_phase_dataset.py \
+  --input-root data/lerobot_dataset_rebuilt_v1 \
+  --output-root data/lerobot_dataset_delta_phase_ep0 \
+  --episode 0 \
+  --delta-horizon-frames 5 \
+  --report-path reports/delta_phase_ep0_report.csv
+
+bash training/train_act_delta_phase_overfit_ep0.sh
+```
+
+如果单条 episode 都不能学出非零时变预测，优先查训练 pipeline、相机输入或模型配置；如果单条可以，再训练全量：
+
+摄像头被碰过且无法复原时，把上面 overfit 命令里的 `--input-root` 换成新采的 `data/lerobot_dataset_one_ep_current_cam`。
+
+```bash
+bash training/train_act_delta_phase.sh
+```
+
+部署 delta+phase checkpoint 时必须加：
+
+```bash
+python3 inference/deploy.py \
+  --checkpt outputs/train/piper_bottle_grasp_delta_phase/checkpoints/010000/pretrained_model \
+  --action-mode delta \
+  --debug-actions \
+  --debug-every 1 \
+  --replan-every-step
+```
+
+训练完先做数值坍缩检查：
+
+```bash
+python3 scripts/check_policy_collapse.py \
+  --checkpt outputs/train/piper_bottle_grasp_delta_phase/checkpoints/010000/pretrained_model \
+  --dataset-root data/lerobot_dataset_delta_phase \
+  --episode 0 \
+  --frames 80
+```
+
+只有当 `collapsed: False`，并且 `pred_step`、`pred_range` 不再接近 0 时，才值得上真机。
 
 ## 4. 批量评估 checkpoint
 
@@ -135,4 +204,4 @@ python3 inference/deploy.py \
 - `target_diff_from_last_target` 持续变化但 `state_diff_from_last_state` 很小，优先查机械臂执行、CAN、速度、限位或使能状态。
 - 每隔 `n_action_steps` 才明显变化，说明 ACT action queue/open-loop chunk 影响很大。
 
-夹爪范围已统一为 Piper 实际的 `0.0-0.035m`，部署侧会 clamp 到这个范围。
+夹爪范围已统一为 Piper 实际读数的 `0.0-0.10m`，部署侧会 clamp 到这个范围。

@@ -515,3 +515,249 @@ python3 scripts/rebuild_trimmed_dataset.py \
 2. **chunk=10 vs chunk=20 取捨**：chunk=10 开环短、更稳定，但预测视野更短；chunk=20 能规划更长轨迹但更容易漂移。需要用实际部署效果来判断。
 
 3. **部署安全**：首次部署新模型时先用 `--dry-run` + `--debug-actions --debug-every 1` 验证，确认 target_diff_from_last_target 在变化后再真机运行。
+
+---
+
+## 2026-05-12 — 模型坍缩根因分析与架构修复（delta action + phase input）
+
+### 坍缩确认
+
+50 episodes 训练完成（chunk=10, use_vae=false, 30K steps），三个 checkpoint（10K/20K/30K）真机部署全部坍缩：
+
+- **pred_range arm = [0, 0, 0, 0, 0, 0]** — 无论什么输入，输出同一个固定 pose
+- **chunk_internal_arm_range = 0** — 10 步 chunk 完全相同
+- 机械臂行为：朝目标位置靠拢后停在半空，不再运动
+
+**离线验证**：对 episode 0 前 80 帧预测，三个 checkpoint 的输出完全一致（mean_abs_diff=0）。
+
+### 根因分析
+
+坍缩不是 VAE 的问题（`use_vae=false` 已关闭 VAE），而是 **absolute action 回归任务本身的平均化趋势**：
+
+1. **action[t] = state[t+1]**（下一帧关节位置）。如果模型学不好输入→输出的映射，在 L2 loss 下最优策略是输出条件均值 —— 一个固定姿势。
+
+2. **关 VAE 不能防坍缩**。确定性回归器在 L1/L2 loss 下，如果无法可靠利用 observation，就会学条件均值/中位数。`use_vae=false` 只是去掉 VAE，不改变回归任务本质。
+
+3. **ACT 的 chunk 位置 embedding 不保证时变轨迹**。decoder query 有位置编码，但 loss 没有强制"第 1 帧和第 10 帧必须不同"。结果就是 10 步 chunk 全是同一个值。
+
+4. **缺少 phase 信息**。从固定起点出发的任务依赖"当前执行到第几步"来判断阶段，单帧图像+当前关节状态不足以判断阶段，导致同一类视觉输入对应多个阶段的不同动作。
+
+### 修复方案
+
+**改数据表示，不是调参**：
+
+#### 1. delta action（相对动作）
+
+```
+delta_action[t] = state[t + horizon] - state[t]   (horizon=5 frames)
+```
+
+部署时：`target = state + predicted_delta`
+
+- 模型输出常数均值 → delta ≈ 0 → 机械臂停在原地，**不会**被吸到半空平均姿势
+- 模型被迫学"当前应该往哪儿动"，而不是"全数据平均姿势是哪儿"
+- 即使预测不完美，也不会在 L2 loss 下趋向一个固定的绝对坐标
+
+#### 2. phase input（进度编码）
+
+observation.state 从 7 维扩到 8 维：`[j1..j6, gripper, phase]`
+
+- 训练时：`phase = frame_index / episode_length`
+- 部署时：`phase = step / max_steps`
+
+打破"同一类视觉输入对应多个阶段动作"的平均化问题。phase 让模型知道当前在轨迹的哪个位置。
+
+#### 3. n_action_steps = 1
+
+不消费 10 步开环队列，每步都 replan（`--replan-every-step`）。配合 delta action，每步从模型拿到的 delta 加到当前状态上得到 target，闭环控制。
+
+### 新增/修改的文件
+
+| 文件 | 功能 |
+|---|---|
+| `scripts/rebuild_delta_phase_dataset.py` | 从原始 absolute action 数据集重建 delta+phase 数据集 |
+| `scripts/check_policy_collapse.py` | 离线检查 checkpoint 是否坍缩（pred_range, chunk_internal_range, pred_step vs gt_step） |
+| `inference/deploy.py` | 新增 `--action-mode delta`、auto 8-dim state + phase 注入、`policy_state_dim()` 自动检测 |
+| `teleop/data_collector.py` | 新增 `--dataset-root` 参数，支持指定输出目录不污染原数据 |
+| `training/train_act_delta_phase.sh` | 全量 50 eps 训练脚本（chunk=10, n_action_steps=1, lr=1e-4, 30K steps） |
+| `training/train_act_delta_phase_overfit_ep0.sh` | 单条 overfit 验证脚本（5K steps, dropout=0, no image transforms） |
+
+### 单条 overfit 验证（episode 0）
+
+```
+collapsed: False  ✅
+mse: 0.000145
+pred_step max: 0.077 rad   vs  gt_step max: 0.069 rad
+pred_range arm: [0.17, 0.31, 0.25, 0.11, 0.17, 0.10]
+chunk_internal_range: mean=0.103, max=0.281
+```
+
+- delta+phase pipeline 验证通过，模型可以学习非恒定轨迹
+- 单条 overfit 模型部署到真机时仍不理想：500 步远超训练 episode 的 194 帧，phase 编码错位；起点/瓶子位置偏差导致视觉输入与训练分布不同 — 这是预期行为
+
+### 数据重采
+
+重新采集 50 episodes（摄像头位置更新），使用当前摄像头配置：
+
+```
+50 episodes, 10,926 frames
+每集 185-264 frames (6-9 seconds)
+零死帧
+action std: j1=0.30, j2=0.53, j3=0.46, j4=0.37, j5=0.46, j6=0.42, gripper=0.031
+```
+
+### 全量训练（进行中）
+
+```bash
+# 1. 重建 delta+phase 数据集
+python3 scripts/rebuild_delta_phase_dataset.py \
+  --input-root data/lerobot_dataset_50eps_current_cam \
+  --output-root data/lerobot_dataset_delta_phase \
+  --delta-horizon-frames 5
+
+# 2. 训练
+bash training/train_act_delta_phase.sh   # 30K steps, chunk=10, n_action_steps=1
+
+# 3. 训练后检查
+python3 scripts/check_policy_collapse.py \
+  --checkpt outputs/train/piper_bottle_grasp_delta_phase/checkpoints/last/pretrained_model \
+  --dataset-root data/lerobot_dataset_delta_phase \
+  --episode 0 --frames 80
+
+# 4. 部署（collapsed=False 之后）
+python3 inference/deploy.py \
+  --checkpt .../pretrained_model \
+  --action-mode delta \
+  --debug-actions --debug-every 1 \
+  --replan-every-step
+```
+
+### 数据集格式
+
+delta+phase 数据集完全遵循 LeRobot v3.0 官方格式：
+
+| 字段 | 原始 | delta+phase |
+|---|---|---|
+| observation.state | shape=[7], j1..gripper | shape=[8], j1..gripper,phase |
+| action | shape=[7], j1..gripper (absolute) | shape=[7], dj1..dgripper (relative delta) |
+| observation.images | shape=[3,480,640], dtype=video | 不变 |
+| stats | mean/std per dim | mean/std per dim (8/7 dim) |
+
+使用 `LeRobotDataset.create()` + `add_frame()` + `save_episode()` + `finalize()` 官方 API 构建。
+
+### 关键教训
+
+1. **absolute action 回归在小数据/阶段不明确条件下容易坍缩成均值姿势**。不是 VAE 的问题，是任务定义本身的问题。
+2. **delta action 从根本上解决了"均值吸引点"问题** —— 模型输出均值时 delta≈0，机械臂不会乱跑。
+3. **phase input 是低成本高收益的特征** —— 增加的 1 维在时间轴上拆开了视觉感知多义性，训练/部署自动计算，不需要额外标定。
+4. **单条 overfit 是验证 pipeline 正确性的最快方法** —— 如果 1 条都背不下来，说明训练/数据有问题。如果 1 条能背、50 条坍缩，说明是数据量/分布/表示的问题。
+5. **chunk_size 不等于 n_action_steps**：chunk=10 提供 10 步时间上下文，n_action_steps=1 只执行第一步就 replan，避免开环漂移。
+
+---
+
+## 2026-05-14 — Tiny ACT 突破 + 部署工程完成
+
+### Big ACT cross-attention 坍缩诊断
+
+**现象**：1 条 approach-only 轨迹、Big ACT (41M, chunk=10) 训练 30K 步，模型输出恒定：
+- 所有 checkpoint pred_j2_std = 0.00000
+- improvement_ratio ≈ 1.0（不比输出均值好）
+
+**诊断手段**：
+1. Mean baseline 统计 — 确认模型 mse ≈ baseline mse
+2. Action queue 隔离 — policy.reset() 每帧，排除队列污染
+3. Raw normalized output 检查 — 确认模型在 norm 空间输出 0
+4. Training batch 数据检查 — 确认数据有正常 range
+5. State/image ablation — 不同输入 → 完全相同的输出
+6. MLP sanity check — 35K 参数 MLP 轻松学会 qpos→action（improvement_ratio=0.0001）
+
+**根因**：ACT decoder cross-attention 坍缩。Decoder 不关注 encoder 输出，只依赖 learned query tokens 输出 ≈0。大模型 (41M) + 小数据 (1 条) + dropout=0 下的退化。
+
+### Tiny ACT 打破坍缩
+
+```bash
+chunk_size=1, n_action_steps=1, dim_model=128 (vs 512)
+n_heads=4, n_encoder_layers=2, n_decoder_layers=2
+~11M 参数（vs 41M）
+```
+
+- 训练 5K 步，loss 快速下降到 ~0.002
+- **3k checkpoint 真机测试：J2 从 -0.018 推到 1.563，成功穿过 Big ACT 卡住的 0.45-0.55 区**
+
+教训：小数据下模型容量必须匹配数据量。chunk_size=1（逐帧预测）比 chunk_size=10 更容易优化，因为不需要学习帧间 temporal structure。
+
+### 部署工程：4 轮迭代消除抖动
+
+#### 迭代 1：α=0.3，比例限幅 0.02，130 步
+
+- J2 只到 0.41，走不动
+- **根因**：比例限幅 bug — 所有关节按最大的 delta 统一缩放，J2 被 J3 拖慢
+
+```python
+# Bug
+max_abs = max(|J1|, ..., |J6|)
+scale = 0.02 / max_abs  # J3 最大 → J2 也被缩小
+```
+
+#### 迭代 2：α=0.2，逐关节限幅 0.03，200 步
+
+- J2 只到 0.90，还是走不动
+- **根因**：α=0.2 拖慢 closed-loop 反馈。机器人每步只走 ~0.01 rad，模型看到进度慢，raw 输出爬不上去
+
+#### 迭代 3：α=0.5，逐关节限幅 0.03，200 步
+
+- J2 到 1.58，但终点 wrist (J4-J6) 抖动
+- **根因**：模型在训练边界附近 (J2>1.5) wrist 预测开始波动，α=0.5 的平滑滞后加剧过冲
+
+#### 迭代 4：α=0.5，per-joint 限幅 + wrist 冻结 + ready stop
+
+```
+J1-J3 max_delta = 0.03   (大臂需要大步推进)
+J4-J6 max_delta = 0.012  (wrist 小幅抑制抖动)
+J2 > 1.45 → 冻结 J4-J6  (模型在边界外的 wrist 预测不可靠)
+J2 > 1.50 连续 5 步 → 自动停止 (自适应到点，不需要预知步数)
+```
+
+**结果**：J2=1.549, 197 步自动停止，全程无抖动，夹爪对准瓶子。
+
+### α 平滑的闭环反馈效应（关键发现）
+
+α 不仅是输出平滑器，还参与 closed-loop 反馈循环：
+
+| α | 每步 J2 增量 | 模型 raw 输出 | 结果 |
+|---|---|---|---|
+| 0.2 | ~0.01 rad | 爬不上去（最高 0.99） | 到不了位 |
+| 0.5 | ~0.02 rad | 爬升到 1.5+ | 能到位 |
+
+模型看到机械臂在推进 → raw 输出递增。走得慢 → 模型以为还没到 → 不给大输出 → 更走不到。这是**正反馈循环**，α 控制着反馈增益。
+
+教训：平滑参数不能只看消抖效果，必须考虑对 closed-loop 运动速度的影响。
+
+### 部署脚本 Test 模式
+
+| 模式 | 流程 |
+|------|------|
+| A | approach → hold → 停止（验证对准） |
+| B | approach → 闭合夹爪 → 抬起 → 回原点 |
+| C | approach → 下探 → 停止 |
+| D | approach → 闭合 → 抬起 → 平移放置 → 释放 → 回原点（完整流程） |
+
+### 当前可用模型
+
+- **Tiny ACT 3k**：`outputs/train/piper_bottle_approach_tiny_1ep/checkpoints/003000/pretrained_model`
+- 1 episode approach-only 数据，absolute action 模式，chunk_size=1
+- Test D 完整抓取流程真机验证通过
+- conda activate piper_act && python3 inference/deploy.py \
+    --checkpt outputs/train/piper_bottle_approach_tiny_1ep/checkpoints/003000/pretrained_model \
+    --test-mode D --debug-actions --replan-every-step
+W
+
+### 关键经验总结
+
+1. **小数据先缩小模型**：41M → 11M，从坍缩到可用
+2. **chunk_size=1 是最简单的成功路径**：避免学习帧间 temporal structure
+3. **MLP sanity check 是最快的排错手段**：35K 参数、200 步训练、15 行代码，直接判断是数据问题还是模型问题
+4. **逐关节独立限幅 >> 统一限幅**：不同关节的物理安全和运动特性不同
+5. **平滑参数参与 closed-loop 反馈**：不能只看消抖效果
+6. **wrist 终点冻结是低成本防抖**：利用大臂已经到位的先验，不依赖模型 wrist 预测
+7. **ready stop 比固定步数更可靠**：自适应到点，防止模型在边界处超调和振荡

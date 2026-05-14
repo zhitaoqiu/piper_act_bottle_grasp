@@ -106,7 +106,7 @@ def camera_loop(wrist_cam, global_cam, buf: ImageBuffer, stop: threading.Event):
 def build_preview(wrist_frame, global_frame, enabled: bool, recording: bool, n_frames: int):
     preview = None
     if wrist_frame is not None:
-        preview = wrist_frame.rgb.copy()
+        preview = cv2.cvtColor(wrist_frame.rgb, cv2.COLOR_RGB2BGR)
         h = preview.shape[0]
         if recording:
             cv2.circle(preview, (30, 30), 12, (0, 0, 255), -1)
@@ -118,7 +118,7 @@ def build_preview(wrist_frame, global_frame, enabled: bool, recording: bool, n_f
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
     if global_frame is not None:
-        g = global_frame.rgb.copy()
+        g = cv2.cvtColor(global_frame.rgb, cv2.COLOR_RGB2BGR)
         if recording:
             cv2.circle(g, (30, 30), 12, (0, 0, 255), -1)
         if preview is not None:
@@ -135,6 +135,50 @@ def ensure_opencv():
     if cv2 is None:
         cv2 = require_opencv()
     return cv2
+
+
+def check_gui_environment():
+    """Print GUI diagnostics and fail early if DISPLAY is missing on Linux."""
+    display = os.environ.get("DISPLAY", "")
+    print(f"  DISPLAY={display if display else 'NOT SET'}")
+    if sys.platform.startswith("linux") and not display:
+        print("\n" + "=" * 60)
+        print("  ERROR: DISPLAY is not set; OpenCV GUI windows cannot be shown.")
+        print("  Are you running over SSH, inside Docker, or on a headless machine?")
+        print("  Try: export DISPLAY=:0")
+        print("=" * 60)
+        raise RuntimeError("DISPLAY not set — cannot create OpenCV windows on Linux")
+    print(f"  OpenCV available: {cv2 is not None}")
+
+
+def safe_read_camera(name: str, cam, last_error_log: dict):
+    """Read one frame from *cam*. Returns CameraFrame or None.
+
+    Errors are printed with throttling (at most once every 2 s per camera).
+    """
+    if cam is None:
+        return None
+    try:
+        return cam.read()
+    except Exception as exc:
+        now = time.time()
+        if now - last_error_log.get(name, 0.0) > 2.0:
+            print(f"  [WARN] {name} camera read failed: {exc}")
+            last_error_log[name] = now
+        return None
+
+
+def create_preview_window(window_name: str, width: int = 1280, height: int = 480):
+    """Create and show an initial OpenCV preview window."""
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_EXPANDED)
+    cv2.resizeWindow(window_name, width, height)
+    test_img = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.putText(test_img, "Initializing...", (width // 3, height // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+    cv2.imshow(window_name, test_img)
+    cv2.waitKey(1)
+    # startWindowThread keeps the GUI alive even if main thread blocks
+    cv2.startWindowThread()
 
 
 def load_lerobot_dataset_class():
@@ -180,13 +224,13 @@ def move_incomplete_dataset(dataset_root: Path) -> Path:
     return backup
 
 
-def create_or_resume_dataset(LeRobotDataset, dataset_root: Path):
+def create_or_resume_dataset(LeRobotDataset, dataset_root: Path, repo_id: str = DATASET_REPO):
     info_path = dataset_root / "meta" / "info.json"
     tasks_path = dataset_root / "meta" / "tasks.parquet"
     features = build_dataset_features()
 
     if info_path.exists() and tasks_path.exists() and has_episode_metadata(dataset_root):
-        dataset = LeRobotDataset.resume(repo_id=DATASET_REPO, root=dataset_root)
+        dataset = LeRobotDataset.resume(repo_id=repo_id, root=dataset_root)
         print(f"  Resumed existing dataset at {dataset_root}")
         return dataset
 
@@ -195,7 +239,7 @@ def create_or_resume_dataset(LeRobotDataset, dataset_root: Path):
         print(f"  [WARN] Incomplete dataset moved to {backup}")
 
     dataset = LeRobotDataset.create(
-        repo_id=DATASET_REPO, fps=CONTROL_RATE_HZ,
+        repo_id=repo_id, fps=CONTROL_RATE_HZ,
         features=features, root=dataset_root, use_videos=True,
     )
     print(f"  Created new dataset at {dataset_root}")
@@ -269,6 +313,16 @@ def parse_args():
         default=5,
         help="Frames kept before detected motion when motion-start detection is enabled.",
     )
+    parser.add_argument(
+        "--dataset-root",
+        default=os.environ.get("PIPER_DATASET_ROOT", DATASET_ROOT),
+        help="LeRobot dataset root for recording. Use a separate root for one-episode tests.",
+    )
+    parser.add_argument(
+        "--dataset-repo-id",
+        default=os.environ.get("PIPER_DATASET_REPO", DATASET_REPO),
+        help="LeRobot dataset repo_id stored in metadata.",
+    )
     return parser.parse_args()
 
 
@@ -297,7 +351,7 @@ def init_cameras(args):
         else:
             wrist_cam = RealSenseCamera(
                 serial=wrist_serial,
-                width=WRIST_WIDTH, height=WRIST_HEIGHT, fps=WRIST_FPS, enable_depth=True,
+                width=WRIST_WIDTH, height=WRIST_HEIGHT, fps=WRIST_FPS, enable_depth=False,
             )
         global_cam = USBCamera(
             device_id=args.global_camera,
@@ -314,30 +368,44 @@ def init_cameras(args):
 
 def run_camera_preview(wrist_cam, global_cam):
     window_name = "ACT Camera Preview | Wrist (L) + Global (R)"
-    stop_event = threading.Event()
-    img_buf = ImageBuffer()
-    cam_thread = threading.Thread(
-        target=camera_loop, args=(wrist_cam, global_cam, img_buf, stop_event), daemon=True
-    )
-    cam_thread.start()
-    print("\n  Camera preview only. Q/ESC = quit\n")
+    create_preview_window(window_name, 1280, 480)
+    print(f"\n  Camera preview only. Q/ESC = quit")
+    if wrist_cam is None and global_cam is None:
+        print("  [WARN] Both cameras are None — no video source available.")
+    print()
 
+    error_log: dict[str, float] = {}
+    last_missing_log = 0.0
     try:
         while True:
-            wrist_frame, global_frame = img_buf.get()
+            wrist_frame = safe_read_camera("wrist", wrist_cam, error_log)
+            global_frame = safe_read_camera("global", global_cam, error_log)
+
             preview = build_preview(wrist_frame, global_frame, True, False, 0)
             if preview is None:
-                preview = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(preview, "Waiting for camera frames", (30, 250),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                preview = np.zeros((480, 1280, 3), dtype=np.uint8)
+                cv2.putText(preview, "Waiting for camera frames...", (400, 250),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                # Periodically print why we have no preview
+                now = time.time()
+                if now - last_missing_log > 3.0:
+                    reasons = []
+                    if wrist_cam is None:
+                        reasons.append("wrist camera not initialized")
+                    elif wrist_frame is None:
+                        reasons.append("wrist frame missing (check camera connection)")
+                    if global_cam is None:
+                        reasons.append("global camera not initialized")
+                    elif global_frame is None:
+                        reasons.append("global frame missing (check camera connection)")
+                    print(f"  [INFO] No preview — " + "; ".join(reasons))
+                    last_missing_log = now
             cv2.imshow(window_name, preview)
+
             key = cv2.waitKey(1) & 0xFF
             if should_quit(key, window_name):
                 break
-            time.sleep(0.01)
     finally:
-        stop_event.set()
-        cam_thread.join(timeout=2.0)
         cv2.destroyAllWindows()
 
 
@@ -358,6 +426,12 @@ def main():
         print(f"  FAIL: {e}")
         return 1
 
+    try:
+        check_gui_environment()
+    except RuntimeError as e:
+        print(f"  FAIL: {e}")
+        return 1
+
     if args.camera_only:
         wrist_cam = None
         global_cam = None
@@ -374,6 +448,11 @@ def main():
     if args.no_wrist:
         print("  FAIL: --no-wrist is only supported together with --camera-only.")
         return 1
+
+    # Create cv2 window BEFORE any hardware init, so we can isolate what breaks it
+    window_name = "ACT Data Collector | Wrist (L) + Global (R)"
+    create_preview_window(window_name, 1280, 480)
+    print(f"  Window '{window_name}' created.")
 
     # --- Robot ---
     from hardware.piper_wrapper import PiperRobot
@@ -395,13 +474,28 @@ def main():
         robot.disconnect()
         return 1
 
+    # Warm up cameras and verify frames are not black/dark
+    print("  Warming up cameras ...")
+    for i in range(15):
+        try:
+            wf = wrist_cam.read()
+            gf = global_cam.read()
+            w_mean = float(wf.rgb.mean())
+            g_mean = float(gf.rgb.mean())
+            if i == 0 or i == 14:
+                print(f"  Frame {i+1}: wrist_mean={w_mean:.1f}, global_mean={g_mean:.1f}")
+        except Exception as e:
+            print(f"  [WARN] Camera warm-up frame {i+1} failed: {e}")
+        time.sleep(0.05)
+    print("  Cameras warmed up.")
+
     # --- LeRobot dataset ---
     print("\n[3/3] Setting up LeRobot dataset ...")
     LeRobotDataset = load_lerobot_dataset_class()
     if LeRobotDataset is not None:
-        dataset_root = Path(DATASET_ROOT)
+        dataset_root = Path(args.dataset_root)
         try:
-            dataset = create_or_resume_dataset(LeRobotDataset, dataset_root)
+            dataset = create_or_resume_dataset(LeRobotDataset, dataset_root, args.dataset_repo_id)
         except Exception as e:
             print(f"  FAIL: {e}")
             robot.disconnect()
@@ -425,15 +519,10 @@ def main():
     start_state = None
     motion_started = False
     motion_preroll = deque(maxlen=max(1, args.preroll_frames))
-    stop_event = threading.Event()
-    img_buf = ImageBuffer()
-
-    cam_thread = threading.Thread(target=camera_loop,
-                                  args=(wrist_cam, global_cam, img_buf, stop_event), daemon=True)
-    cam_thread.start()
-
     wrist_frame = None
     global_frame = None
+    camera_error_log: dict[str, float] = {}
+    last_missing_log = 0.0
 
     print("\n" + "─" * 60)
     print("  SPACE = record/save    R = discard+restart")
@@ -455,22 +544,22 @@ def main():
             t0 = time.time()
 
             # --- Read robot state ---
+            cur_state = None
             try:
                 cur_state = robot.get_joint_positions()
-            except Exception:
-                time.sleep(0.01)
-                continue
+            except Exception as e:
+                now = time.time()
+                if now - camera_error_log.get("robot_state", 0.0) > 2.0:
+                    print(f"  [WARN] robot.get_joint_positions failed: {e}")
+                    camera_error_log["robot_state"] = now
 
-            # --- Grab images ---
+            # --- Grab images (main thread, no threading) ---
             if frame_idx % img_interval == 0:
-                wf, gf = img_buf.get()
-                if wf is not None:
-                    wrist_frame = wf
-                if gf is not None:
-                    global_frame = gf
+                wrist_frame = safe_read_camera("wrist", wrist_cam, camera_error_log)
+                global_frame = safe_read_camera("global", global_cam, camera_error_log)
 
             # --- Record (action = next state) ---
-            if recording and dataset is not None:
+            if recording and dataset is not None and cur_state is not None:
                 if prev_state is not None and wrist_frame is not None and global_frame is not None:
                     frame = {
                         "observation.state": np.array(prev_state, dtype=np.float32),
@@ -508,13 +597,31 @@ def main():
                                 except Exception as e:
                                     print(f"  [WARN] add_frame: {e}")
                 prev_state = cur_state
+            elif recording and cur_state is None:
+                now = time.time()
+                if now - camera_error_log.get("record_skip", 0.0) > 2.0:
+                    print("  [WARN] skip recording frame: robot state missing")
+                    camera_error_log["record_skip"] = now
 
             # --- Preview ---
             preview = build_preview(wrist_frame, global_frame, robot.is_enabled, recording,
                                     dataset_buffer_size(dataset) if recording and dataset else 0)
-            window_name = "ACT Data Collector | Wrist (L) + Global (R)"
-            if preview is not None:
-                cv2.imshow(window_name, preview)
+            if preview is None:
+                preview = np.zeros((480, 1280, 3), dtype=np.uint8)
+                cv2.putText(preview, "Waiting for cameras...", (400, 250),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                # Periodically explain WHY there is no preview
+                now = time.time()
+                if now - last_missing_log > 3.0:
+                    reasons = []
+                    if wrist_frame is None:
+                        reasons.append("wrist frame missing")
+                    if global_frame is None:
+                        reasons.append("global frame missing")
+                    if reasons:
+                        print(f"  [INFO] No preview — " + "; ".join(reasons))
+                    last_missing_log = now
+            cv2.imshow(window_name, preview)
 
             # --- Keyboard ---
             key = cv2.waitKey(1) & 0xFF
@@ -574,8 +681,6 @@ def main():
         print("\n  Interrupted.")
     finally:
         print("  Shutting down ...")
-        stop_event.set()
-        cam_thread.join(timeout=2.0)
         if dataset is not None:
             print("  Finalizing dataset ...")
             try:
